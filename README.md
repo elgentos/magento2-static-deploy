@@ -1,6 +1,6 @@
 # Magento Static Content Deployer (Go)
 
-A high-performance static content deployment tool written in Go that significantly accelerates Magento 2 static asset deployment by leveraging true parallelization and efficient file I/O.
+Experimental!! A high-performance static content deployment tool written in Go that significantly accelerates Magento 2 static asset deployment by leveraging true parallelization and efficient file I/O.
 
 ## Performance
 
