@@ -1,3 +1,3 @@
-module magento2-static-deploy
+module github.com/elgentos/magento2-static-deploy
 
 go 1.21
