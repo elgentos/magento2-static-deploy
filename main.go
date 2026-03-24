@@ -222,6 +222,9 @@ func deployStatic(magentoRoot string, locales, themes, areas []string, numJobs i
 	// Process jobs in parallel
 	results := processJobs(magentoRoot, jobs, numJobs, verbose, version)
 
+	// Ensure both minified and unminified versions of CSS/JS files exist
+	ensureMinifiedCounterparts(magentoRoot, results, verbose)
+
 	// Compile LESS files (email CSS) after file copying is complete
 	compileLessForResults(magentoRoot, results, verbose)
 
@@ -235,6 +238,78 @@ func deployStatic(magentoRoot string, locales, themes, areas []string, numJobs i
 	}
 
 	return results
+}
+
+// ensureMinifiedCounterparts walks each deployed directory and ensures that both
+// minified (.min.js/.min.css) and unminified versions exist for every CSS/JS file.
+// Magento's RequireJS resolver expects both to be present depending on store config.
+func ensureMinifiedCounterparts(magentoRoot string, results []DeployResult, verbose bool) {
+	if verbose {
+		fmt.Printf("\nEnsuring minified/unminified counterparts...\n")
+	}
+
+	for _, result := range results {
+		if result.Error != "" {
+			continue
+		}
+
+		destDir := filepath.Join(magentoRoot, "pub/static", result.Job.Area, result.Job.Theme, result.Job.Locale)
+		var created int64
+
+		filepath.Walk(destDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return nil
+			}
+
+			name := info.Name()
+
+			switch {
+			// .min.js exists but .js counterpart does not
+			case strings.HasSuffix(name, ".min.js"):
+				counterpart := strings.TrimSuffix(path, ".min.js") + ".js"
+				if _, err := os.Stat(counterpart); os.IsNotExist(err) {
+					if copyFile(path, counterpart) == nil {
+						created++
+					}
+				}
+			// .js exists but .min.js counterpart does not
+			case strings.HasSuffix(name, ".js"):
+				counterpart := strings.TrimSuffix(path, ".js") + ".min.js"
+				if _, err := os.Stat(counterpart); os.IsNotExist(err) {
+					if copyFile(path, counterpart) == nil {
+						created++
+					}
+				}
+			// .min.css exists but .css counterpart does not
+			case strings.HasSuffix(name, ".min.css"):
+				counterpart := strings.TrimSuffix(path, ".min.css") + ".css"
+				if _, err := os.Stat(counterpart); os.IsNotExist(err) {
+					if copyFile(path, counterpart) == nil {
+						created++
+					}
+				}
+			// .css exists but .min.css counterpart does not
+			case strings.HasSuffix(name, ".css"):
+				counterpart := strings.TrimSuffix(path, ".css") + ".min.css"
+				if _, err := os.Stat(counterpart); os.IsNotExist(err) {
+					if copyFile(path, counterpart) == nil {
+						created++
+					}
+				}
+			}
+
+			return nil
+		})
+
+		if verbose && created > 0 {
+			fmt.Printf("  %s/%s (%s): created %d counterpart files\n",
+				result.Job.Theme, result.Job.Area, result.Job.Locale, created)
+		}
+	}
+
+	if verbose {
+		fmt.Println()
+	}
 }
 
 // compileLessForResults compiles LESS files for all successful deployment results
@@ -1100,7 +1175,7 @@ func getVendorThemePath(area string, themeName string) string {
 		}
 		return filepath.Join("vendor", vendor, "theme-frontend-"+theme)
 	case "hyva":
-		return filepath.Join("vendor", "hyva-themes", "magento2-hyva-"+theme, "web")
+		return filepath.Join("vendor", "hyva-themes", "magento2-hyva-"+theme)
 	case "mage-os", "mageos":
 		return filepath.Join("vendor", "mage-os", "theme-"+area+"-"+theme)
 	default:
