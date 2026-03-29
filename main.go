@@ -469,12 +469,14 @@ func isHyvaTheme(magentoRoot string, area string, themeName string, visited map[
 		tailwindPaths := []string{
 			filepath.Join(themePath, "web/tailwind/tailwind.config.js"),
 			filepath.Join(themePath, "web/tailwind/tailwind.config.cjs"),
+			filepath.Join(themePath, "web/tailwind/tailwind-source.css"),
 		}
 		for _, tailwindPath := range tailwindPaths {
 			if _, err := os.Stat(tailwindPath); err == nil {
 				return true
 			}
 		}
+
 	}
 
 	// Check parent theme
