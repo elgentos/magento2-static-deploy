@@ -106,7 +106,111 @@ func (lp *LessPreprocessor) stageSourceFiles(area, theme string) error {
 		}
 	}
 
+	// Stage module LESS files from vendor packages (e.g. Magento_Catalog/css/source/_email.less)
+	// These are needed for @magento_import expansion in email.less and email-inline.less
+	lp.stageModuleLessFiles(area)
+
 	return nil
+}
+
+// stageModuleLessFiles stages LESS files from vendor and app/code modules into the
+// staging directory under their module name prefix (e.g. Magento_Catalog/css/source/_email.less).
+// This enables findModuleImports() to resolve @magento_import directives.
+func (lp *LessPreprocessor) stageModuleLessFiles(area string) {
+	// Stage from vendor packages
+	vendorDir := filepath.Join(lp.magentoRoot, "vendor")
+	vendorEntries, err := os.ReadDir(vendorDir)
+	if err != nil {
+		return
+	}
+
+	for _, vendorEntry := range vendorEntries {
+		if !vendorEntry.IsDir() {
+			continue
+		}
+
+		vendorPath := filepath.Join(vendorDir, vendorEntry.Name())
+		packageEntries, err := os.ReadDir(vendorPath)
+		if err != nil {
+			continue
+		}
+
+		for _, packageEntry := range packageEntries {
+			if !packageEntry.IsDir() {
+				continue
+			}
+			packagePath := filepath.Join(vendorPath, packageEntry.Name())
+
+			moduleName := getModuleName(packagePath)
+			if moduleName != "" {
+				lp.stageModuleWebLess(packagePath, moduleName, area)
+			}
+
+			// Check for multi-module packages (src/*/view/...)
+			srcPath := filepath.Join(packagePath, "src")
+			srcEntries, err := os.ReadDir(srcPath)
+			if err != nil {
+				continue
+			}
+			for _, srcEntry := range srcEntries {
+				if !srcEntry.IsDir() {
+					continue
+				}
+				subModulePath := filepath.Join(srcPath, srcEntry.Name())
+				subModuleName := getModuleName(subModulePath)
+				if subModuleName != "" {
+					lp.stageModuleWebLess(subModulePath, subModuleName, area)
+				}
+			}
+		}
+	}
+
+	// Stage from app/code modules
+	appCodeDir := filepath.Join(lp.magentoRoot, "app", "code")
+	appCodeVendors, err := os.ReadDir(appCodeDir)
+	if err != nil {
+		return
+	}
+
+	for _, appVendorEntry := range appCodeVendors {
+		if !appVendorEntry.IsDir() {
+			continue
+		}
+
+		appVendorPath := filepath.Join(appCodeDir, appVendorEntry.Name())
+		moduleEntries, err := os.ReadDir(appVendorPath)
+		if err != nil {
+			continue
+		}
+
+		for _, moduleEntry := range moduleEntries {
+			if !moduleEntry.IsDir() {
+				continue
+			}
+			modulePath := filepath.Join(appVendorPath, moduleEntry.Name())
+			moduleName := getModuleName(modulePath)
+			if moduleName != "" {
+				lp.stageModuleWebLess(modulePath, moduleName, area)
+			}
+		}
+	}
+}
+
+// stageModuleWebLess copies LESS files from a module's view/{area}/web and view/base/web
+// directories into the staging directory under the module name prefix.
+func (lp *LessPreprocessor) stageModuleWebLess(modulePath, moduleName, area string) {
+	webDirs := []string{
+		filepath.Join(modulePath, "view", area, "web"),
+		filepath.Join(modulePath, "view", "base", "web"),
+	}
+
+	for _, webDir := range webDirs {
+		if _, err := os.Stat(webDir); os.IsNotExist(err) {
+			continue
+		}
+		destPrefix := filepath.Join(lp.stagingDir, moduleName)
+		lp.copyLessFiles(webDir, destPrefix)
+	}
 }
 
 // copyLessFiles recursively copies LESS and related files

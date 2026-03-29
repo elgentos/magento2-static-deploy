@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,6 +48,25 @@ func (lc *LessCompiler) CompileEmailCSS(stagingDir, destDir, area, theme, locale
 	}
 
 	for _, lessFileName := range emailFiles {
+		cssFileName := strings.TrimSuffix(lessFileName, ".less") + ".css"
+		cssPath := filepath.Join(destDir, "css", cssFileName)
+
+		// Ensure css directory exists
+		os.MkdirAll(filepath.Join(destDir, "css"), 0755)
+
+		// If the theme (or a parent) provides a pre-compiled CSS file, use it instead of
+		// compiling from LESS. The staging dir applies correct priority (theme overrides base),
+		// so a CSS file here means the theme intends to use its own pre-built version.
+		stagedCssPath := filepath.Join(stagingDir, "css", cssFileName)
+		if _, err := os.Stat(stagedCssPath); err == nil {
+			if err := copyFileSimple(stagedCssPath, cssPath); err == nil {
+				if lc.verbose {
+					fmt.Printf("    ✓ Using pre-compiled css/%s from theme\n", cssFileName)
+				}
+				continue
+			}
+		}
+
 		sourcePath := filepath.Join(stagingDir, "css", lessFileName)
 
 		if _, err := os.Stat(sourcePath); os.IsNotExist(err) {
@@ -55,13 +75,6 @@ func (lc *LessCompiler) CompileEmailCSS(stagingDir, destDir, area, theme, locale
 			}
 			continue
 		}
-
-		// Output CSS file path
-		cssFileName := strings.TrimSuffix(lessFileName, ".less") + ".css"
-		cssPath := filepath.Join(destDir, "css", cssFileName)
-
-		// Ensure css directory exists
-		os.MkdirAll(filepath.Join(destDir, "css"), 0755)
 
 		// Compile LESS to CSS using PHP
 		if err := lc.compileLessFile(sourcePath, cssPath, stagingDir, area, theme, locale); err != nil {
@@ -166,6 +179,24 @@ try {
 	}
 
 	return nil
+}
+
+// copyFileSimple copies a single file from src to dst
+func copyFileSimple(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, in)
+	return err
 }
 
 // phpArrayString converts a Go string slice to PHP array syntax
