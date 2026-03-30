@@ -166,7 +166,7 @@ The tool automatically detects whether each theme is Hyvä-based or Luma-based:
 
 **Hyvä themes** are detected by:
 1. Checking if the theme inherits from `Hyva/default` or `Hyva/reset`
-2. Looking for `web/tailwind/tailwind.config.js` in the theme
+2. Looking for `web/tailwind/tailwind.config.js` or `web/tailwind/tailwind-source.css` in the theme. (For Tailwind v3 and v4 respectively)
 
 **Luma themes** are everything else (including Magento/blank, Magento/luma, and custom Luma-based themes).
 

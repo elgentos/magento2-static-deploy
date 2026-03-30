@@ -304,6 +304,9 @@ func deployStatic(magentoRoot string, locales, themes, areas []string, numJobs i
 		results = append(results, symlinkLocaleResults...)
 	}
 
+	// Ensure both minified and unminified versions of CSS/JS files exist
+	ensureMinifiedCounterparts(magentoRoot, results, verbose)
+
 	// Compile LESS files (email CSS) after file copying is complete
 	compileLessForResults(magentoRoot, results, verbose)
 
@@ -317,6 +320,78 @@ func deployStatic(magentoRoot string, locales, themes, areas []string, numJobs i
 	}
 
 	return results
+}
+
+// ensureMinifiedCounterparts walks each deployed directory and ensures that both
+// minified (.min.js/.min.css) and unminified versions exist for every CSS/JS file.
+// Magento's RequireJS resolver expects both to be present depending on store config.
+func ensureMinifiedCounterparts(magentoRoot string, results []DeployResult, verbose bool) {
+	if verbose {
+		fmt.Printf("\nEnsuring minified/unminified counterparts...\n")
+	}
+
+	for _, result := range results {
+		if result.Error != "" {
+			continue
+		}
+
+		destDir := filepath.Join(magentoRoot, "pub/static", result.Job.Area, result.Job.Theme, result.Job.Locale)
+		var created int64
+
+		filepath.Walk(destDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return nil
+			}
+
+			name := info.Name()
+
+			switch {
+			// .min.js exists but .js counterpart does not
+			case strings.HasSuffix(name, ".min.js"):
+				counterpart := strings.TrimSuffix(path, ".min.js") + ".js"
+				if _, err := os.Stat(counterpart); os.IsNotExist(err) {
+					if copyFile(path, counterpart) == nil {
+						created++
+					}
+				}
+			// .js exists but .min.js counterpart does not
+			case strings.HasSuffix(name, ".js"):
+				counterpart := strings.TrimSuffix(path, ".js") + ".min.js"
+				if _, err := os.Stat(counterpart); os.IsNotExist(err) {
+					if copyFile(path, counterpart) == nil {
+						created++
+					}
+				}
+			// .min.css exists but .css counterpart does not
+			case strings.HasSuffix(name, ".min.css"):
+				counterpart := strings.TrimSuffix(path, ".min.css") + ".css"
+				if _, err := os.Stat(counterpart); os.IsNotExist(err) {
+					if copyFile(path, counterpart) == nil {
+						created++
+					}
+				}
+			// .css exists but .min.css counterpart does not
+			case strings.HasSuffix(name, ".css"):
+				counterpart := strings.TrimSuffix(path, ".css") + ".min.css"
+				if _, err := os.Stat(counterpart); os.IsNotExist(err) {
+					if copyFile(path, counterpart) == nil {
+						created++
+					}
+				}
+			}
+
+			return nil
+		})
+
+		if verbose && created > 0 {
+			fmt.Printf("  %s/%s (%s): created %d counterpart files\n",
+				result.Job.Theme, result.Job.Area, result.Job.Locale, created)
+		}
+	}
+
+	if verbose {
+		fmt.Println()
+	}
 }
 
 // compileLessForResults compiles LESS files for all successful deployment results
@@ -381,7 +456,10 @@ func themeExists(magentoRoot string, area string, themeName string) bool {
 			return true
 		}
 	}
-	return false
+
+	// Fallback: try auto-discovery for non-standard vendor package names
+	discoveredPath := discoverVendorThemePath(magentoRoot, area, themeName)
+	return discoveredPath != ""
 }
 
 // getThemePath returns the physical path of a theme
@@ -392,10 +470,17 @@ func getThemePath(magentoRoot string, area string, themeName string) string {
 		return appDesignPath
 	}
 
-	// Check vendor path
+	// Check vendor path using conventional naming
 	vendorPath := filepath.Join(magentoRoot, getVendorThemePath(area, themeName))
 	if _, err := os.Stat(vendorPath); err == nil {
 		return vendorPath
+	}
+
+	// Fallback: auto-discover vendor theme path by scanning registration.php files
+	// This handles non-standard Composer package naming conventions
+	discoveredPath := discoverVendorThemePath(magentoRoot, area, themeName)
+	if discoveredPath != "" {
+		return discoveredPath
 	}
 
 	return ""
@@ -466,12 +551,14 @@ func isHyvaTheme(magentoRoot string, area string, themeName string, visited map[
 		tailwindPaths := []string{
 			filepath.Join(themePath, "web/tailwind/tailwind.config.js"),
 			filepath.Join(themePath, "web/tailwind/tailwind.config.cjs"),
+			filepath.Join(themePath, "web/tailwind/tailwind-source.css"),
 		}
 		for _, tailwindPath := range tailwindPaths {
 			if _, err := os.Stat(tailwindPath); err == nil {
 				return true
 			}
 		}
+
 	}
 
 	// Check parent theme
@@ -703,25 +790,33 @@ func deployTheme(magentoRoot string, job DeployJob, version string, useSymlink b
 			}
 		}
 
-		// 1b. Copy theme module overrides (app/design/{area}/{vendor}/{theme}/{ModuleName}/web/)
+		// 1b. Copy theme module overrides ({themePath}/{ModuleName}/web/)
 		// These override module web assets in the theme
-		themeBaseDir := filepath.Join(magentoRoot, "app/design", job.Area, chainVendor, chainName)
-		if themeEntries, err := os.ReadDir(themeBaseDir); err == nil {
-			for _, entry := range themeEntries {
-				// Skip non-directories and the "web" directory itself
-				if !entry.IsDir() || entry.Name() == "web" {
-					continue
-				}
-				// Check if this is a module override (contains a web directory)
-				moduleWebDir := filepath.Join(themeBaseDir, entry.Name(), "web")
-				if _, err := os.Stat(moduleWebDir); err == nil {
-					// This is a module override - deploy to ModuleName/ prefix
-					moduleName := entry.Name()
-					count, err := copyDirectoryWithModulePrefix(moduleWebDir, destDir, moduleName, useSymlink)
-					if err != nil {
+		// Check both app/design and vendor theme paths
+		themeBaseDirs := []string{
+			filepath.Join(magentoRoot, "app/design", job.Area, chainVendor, chainName),
+		}
+		if vendorThemePath != "" {
+			themeBaseDirs = append(themeBaseDirs, vendorThemePath)
+		}
+		for _, themeBaseDir := range themeBaseDirs {
+			if themeEntries, err := os.ReadDir(themeBaseDir); err == nil {
+				for _, entry := range themeEntries {
+					// Skip non-directories and the "web" directory itself
+					if !entry.IsDir() || entry.Name() == "web" {
 						continue
 					}
-					fileCount += count
+					// Check if this is a module override (contains a web directory)
+					moduleWebDir := filepath.Join(themeBaseDir, entry.Name(), "web")
+					if _, err := os.Stat(moduleWebDir); err == nil {
+						// This is a module override - deploy to ModuleName/ prefix
+						moduleName := entry.Name()
+						count, err := copyDirectoryWithModulePrefix(moduleWebDir, destDir, moduleName, useSymlink)
+						if err != nil {
+							continue
+						}
+						fileCount += count
+					}
 				}
 			}
 		}
@@ -845,6 +940,52 @@ func deployTheme(magentoRoot string, job DeployJob, version string, useSymlink b
 							fileCount += count
 						}
 					}
+				}
+			}
+		}
+	}
+
+	// 4. Copy extension view files from app/code modules (app/code/{Vendor}/{Module}/view/{area}/web/)
+	appCodeDir := filepath.Join(magentoRoot, "app", "code")
+	appCodeVendors, err := os.ReadDir(appCodeDir)
+	if err == nil {
+		for _, appVendorEntry := range appCodeVendors {
+			if !appVendorEntry.IsDir() {
+				continue
+			}
+
+			appVendorPath := filepath.Join(appCodeDir, appVendorEntry.Name())
+			moduleEntries, err := os.ReadDir(appVendorPath)
+			if err != nil {
+				continue
+			}
+
+			for _, moduleEntry := range moduleEntries {
+				if !moduleEntry.IsDir() {
+					continue
+				}
+				modulePath := filepath.Join(appVendorPath, moduleEntry.Name())
+
+				moduleName := getModuleName(modulePath)
+
+				// Check for view/{area}/web/
+				moduleWebDir := filepath.Join(modulePath, "view", job.Area, "web")
+				if _, err := os.Stat(moduleWebDir); err == nil {
+					count, err := copyDirectoryWithModulePrefix(moduleWebDir, destDir, moduleName, useSymlink)
+					if err != nil {
+						continue
+					}
+					fileCount += count
+				}
+
+				// Check for view/base/web/
+				moduleBaseDir := filepath.Join(modulePath, "view", "base", "web")
+				if _, err := os.Stat(moduleBaseDir); err == nil {
+					count, err := copyDirectoryWithModulePrefix(moduleBaseDir, destDir, moduleName, useSymlink)
+					if err != nil {
+						continue
+					}
+					fileCount += count
 				}
 			}
 		}
@@ -1002,6 +1143,86 @@ func createDeploymentVersionFile(magentoRoot string, version string, verbose boo
 	return nil
 }
 
+// vendorThemeCache caches discovered vendor theme paths to avoid repeated filesystem scans
+var vendorThemeCache = make(map[string]string)
+var vendorThemeCacheMutex sync.RWMutex
+
+// discoverVendorThemePath scans vendor/ directory for theme registration.php files
+// to dynamically find theme paths regardless of Composer package naming conventions.
+// Returns the discovered path or empty string if not found.
+func discoverVendorThemePath(magentoRoot string, area string, themeName string) string {
+	cacheKey := area + "/" + themeName
+
+	// Check cache first
+	vendorThemeCacheMutex.RLock()
+	if cachedPath, found := vendorThemeCache[cacheKey]; found {
+		vendorThemeCacheMutex.RUnlock()
+		return cachedPath
+	}
+	vendorThemeCacheMutex.RUnlock()
+
+	vendorDir := filepath.Join(magentoRoot, "vendor")
+	vendorEntries, err := os.ReadDir(vendorDir)
+	if err != nil {
+		return ""
+	}
+
+	// The registration pattern we're looking for:
+	// ComponentRegistrar::register(ComponentRegistrar::THEME, 'frontend/Vendor/default', __DIR__);
+	// or with double quotes
+	searchPattern := area + "/" + themeName
+
+	for _, vendorEntry := range vendorEntries {
+		if !vendorEntry.IsDir() {
+			continue
+		}
+		vendorName := vendorEntry.Name()
+		vendorPath := filepath.Join(vendorDir, vendorName)
+
+		packageEntries, err := os.ReadDir(vendorPath)
+		if err != nil {
+			continue
+		}
+
+		for _, packageEntry := range packageEntries {
+			if !packageEntry.IsDir() {
+				continue
+			}
+			packagePath := filepath.Join(vendorPath, packageEntry.Name())
+
+			// Check for registration.php
+			registrationPath := filepath.Join(packagePath, "registration.php")
+			data, err := os.ReadFile(registrationPath)
+			if err != nil {
+				continue
+			}
+
+			content := string(data)
+
+			// Check if this is a theme registration for our target theme
+			// Look for both single and double quote patterns
+			if strings.Contains(content, "ComponentRegistrar::THEME") &&
+				(strings.Contains(content, "'"+searchPattern+"'") ||
+					strings.Contains(content, "\""+searchPattern+"\"")) {
+				// Found it! Cache and return the path
+				vendorThemeCacheMutex.Lock()
+				vendorThemeCache[cacheKey] = packagePath
+				vendorThemeCacheMutex.Unlock()
+				if verboseFlag {
+					fmt.Printf("  Auto-discovered vendor theme: %s -> %s\n", themeName, packagePath)
+				}
+				return packagePath
+			}
+		}
+	}
+
+	// Cache negative result too to avoid repeated scans
+	vendorThemeCacheMutex.Lock()
+	vendorThemeCache[cacheKey] = ""
+	vendorThemeCacheMutex.Unlock()
+	return ""
+}
+
 // getVendorThemePath converts a theme name to its vendor package path
 // e.g., "Magento/backend" with adminhtml -> "vendor/magento/theme-adminhtml-backend"
 // e.g., "Hyva/reset" with frontend -> "vendor/hyva-themes/magento2-hyva-reset"
@@ -1023,7 +1244,7 @@ func getVendorThemePath(area string, themeName string) string {
 		}
 		return filepath.Join("vendor", vendor, "theme-frontend-"+theme)
 	case "hyva":
-		return filepath.Join("vendor", "hyva-themes", "magento2-hyva-"+theme, "web")
+		return filepath.Join("vendor", "hyva-themes", "magento2-hyva-"+theme)
 	case "mage-os", "mageos":
 		return filepath.Join("vendor", "mage-os", "theme-"+area+"-"+theme)
 	default:
