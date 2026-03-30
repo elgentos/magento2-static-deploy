@@ -305,7 +305,7 @@ func deployStatic(magentoRoot string, locales, themes, areas []string, numJobs i
 	}
 
 	// Ensure both minified and unminified versions of CSS/JS files exist
-	ensureMinifiedCounterparts(magentoRoot, results, verbose)
+	ensureMinifiedCounterparts(magentoRoot, results, verbose, useSymlink)
 
 	// Compile LESS files (email CSS) after file copying is complete
 	compileLessForResults(magentoRoot, results, verbose)
@@ -325,13 +325,13 @@ func deployStatic(magentoRoot string, locales, themes, areas []string, numJobs i
 // ensureMinifiedCounterparts walks each deployed directory and ensures that both
 // minified (.min.js/.min.css) and unminified versions exist for every CSS/JS file.
 // Magento's RequireJS resolver expects both to be present depending on store config.
-func ensureMinifiedCounterparts(magentoRoot string, results []DeployResult, verbose bool) {
+func ensureMinifiedCounterparts(magentoRoot string, results []DeployResult, verbose bool, useSymlink bool) {
 	if verbose {
 		fmt.Printf("\nEnsuring minified/unminified counterparts...\n")
 	}
 
 	for _, result := range results {
-		if result.Error != "" {
+		if result.Error != "" || result.Symlinked {
 			continue
 		}
 
@@ -349,32 +349,32 @@ func ensureMinifiedCounterparts(magentoRoot string, results []DeployResult, verb
 			// .min.js exists but .js counterpart does not
 			case strings.HasSuffix(name, ".min.js"):
 				counterpart := strings.TrimSuffix(path, ".min.js") + ".js"
-				if _, err := os.Stat(counterpart); os.IsNotExist(err) {
-					if copyFile(path, counterpart) == nil {
+				if _, err := os.Lstat(counterpart); os.IsNotExist(err) {
+					if placeFile(path, counterpart, useSymlink) == nil {
 						created++
 					}
 				}
 			// .js exists but .min.js counterpart does not
 			case strings.HasSuffix(name, ".js"):
 				counterpart := strings.TrimSuffix(path, ".js") + ".min.js"
-				if _, err := os.Stat(counterpart); os.IsNotExist(err) {
-					if copyFile(path, counterpart) == nil {
+				if _, err := os.Lstat(counterpart); os.IsNotExist(err) {
+					if placeFile(path, counterpart, useSymlink) == nil {
 						created++
 					}
 				}
 			// .min.css exists but .css counterpart does not
 			case strings.HasSuffix(name, ".min.css"):
 				counterpart := strings.TrimSuffix(path, ".min.css") + ".css"
-				if _, err := os.Stat(counterpart); os.IsNotExist(err) {
-					if copyFile(path, counterpart) == nil {
+				if _, err := os.Lstat(counterpart); os.IsNotExist(err) {
+					if placeFile(path, counterpart, useSymlink) == nil {
 						created++
 					}
 				}
 			// .css exists but .min.css counterpart does not
 			case strings.HasSuffix(name, ".css"):
 				counterpart := strings.TrimSuffix(path, ".css") + ".min.css"
-				if _, err := os.Stat(counterpart); os.IsNotExist(err) {
-					if copyFile(path, counterpart) == nil {
+				if _, err := os.Lstat(counterpart); os.IsNotExist(err) {
+					if placeFile(path, counterpart, useSymlink) == nil {
 						created++
 					}
 				}
@@ -1328,4 +1328,3 @@ func shouldSkipFile(relPath string) bool {
 
 	return false
 }
-
