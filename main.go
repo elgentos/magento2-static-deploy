@@ -25,10 +25,12 @@ type DeployJob struct {
 
 // DeployResult tracks the result of a deployment job
 type DeployResult struct {
-	Job        DeployJob
-	FilesCount int64
-	Duration   time.Duration
-	Error      string
+	Job           DeployJob
+	FilesCount    int64
+	Duration      time.Duration
+	Error         string
+	Symlinked     bool
+	SymlinkTarget string
 }
 
 // ModuleConfig represents a Magento module.xml structure
@@ -58,6 +60,7 @@ var (
 	contentVersion   string
 	noLumaDispatch   bool
 	phpBinary        string
+	symlinkMode      string
 )
 
 func init() {
@@ -73,6 +76,7 @@ func init() {
 	flag.StringVar(&contentVersion, "content-version", "", "Custom version of static content")
 	flag.BoolVar(&noLumaDispatch, "no-luma-dispatch", false, "Disable automatic dispatch of Luma themes to bin/magento")
 	flag.StringVar(&phpBinary, "php", "php", "Path to PHP binary for Luma theme dispatch")
+	flag.StringVar(&symlinkMode, "symlink", "", "Use symlinks instead of copies: 'file' (per-file symlinks to source) or 'locale' (directory-level symlinks for identical locales)")
 
 	// Custom usage message
 	flag.Usage = func() {
@@ -91,6 +95,11 @@ func init() {
 
 func main() {
 	flag.Parse()
+
+	if symlinkMode != "" && symlinkMode != "file" && symlinkMode != "locale" {
+		fmt.Fprintf(os.Stderr, "Error: --symlink must be 'file' or 'locale', got '%s'\n", symlinkMode)
+		os.Exit(1)
+	}
 
 	// Collect languages from positional arguments and --language flags
 	languages := collectLanguages()
@@ -122,7 +131,11 @@ func main() {
 		fmt.Printf("Themes: %v\n", themes)
 		fmt.Printf("Areas: %v\n", areas)
 		fmt.Printf("Parallel Jobs: %d\n", numJobs)
-		fmt.Printf("Strategy: %s\n\n", strategyFlag)
+		fmt.Printf("Strategy: %s\n", strategyFlag)
+		if symlinkMode != "" {
+			fmt.Printf("Symlink mode: %s\n", symlinkMode)
+		}
+		fmt.Println()
 	}
 
 	// Classify themes into Hyvä and Luma
@@ -153,6 +166,7 @@ func main() {
 			numJobs,
 			verboseFlag,
 			contentVersion,
+			symlinkMode,
 		)
 
 		printResults(results, time.Since(start))
@@ -204,15 +218,40 @@ func collectLanguages() []string {
 }
 
 // deployStatic orchestrates the parallel deployment
-func deployStatic(magentoRoot string, locales, themes, areas []string, numJobs int, verbose bool, contentVersion string) []DeployResult {
+func deployStatic(magentoRoot string, locales, themes, areas []string, numJobs int, verbose bool, contentVersion string, symlinkMode string) []DeployResult {
 	// Use provided content version or generate one based on current timestamp
 	version := contentVersion
 	if version == "" {
 		version = fmt.Sprintf("%d", time.Now().Unix())
 	}
 
+	useSymlink := (symlinkMode == "file" || symlinkMode == "locale")
+
 	// Create deployment jobs
 	jobs := createDeployJobs(locales, themes, areas)
+
+	// Locale-level symlink mode: only deploy the first locale per (theme, area)
+	// group and create directory symlinks for the rest
+	type themeAreaKey struct{ Theme, Area string }
+	var kept map[themeAreaKey]string
+	var deferred map[themeAreaKey][]string
+
+	if symlinkMode == "locale" && len(locales) > 1 {
+		kept = make(map[themeAreaKey]string)
+		deferred = make(map[themeAreaKey][]string)
+		var filteredJobs []DeployJob
+
+		for _, job := range jobs {
+			key := themeAreaKey{job.Theme, job.Area}
+			if _, exists := kept[key]; !exists {
+				kept[key] = job.Locale
+				filteredJobs = append(filteredJobs, job)
+			} else {
+				deferred[key] = append(deferred[key], job.Locale)
+			}
+		}
+		jobs = filteredJobs
+	}
 
 	if verbose {
 		fmt.Printf("Created %d deployment jobs\n", len(jobs))
@@ -220,10 +259,53 @@ func deployStatic(magentoRoot string, locales, themes, areas []string, numJobs i
 	}
 
 	// Process jobs in parallel
-	results := processJobs(magentoRoot, jobs, numJobs, verbose, version)
+	results := processJobs(magentoRoot, jobs, numJobs, verbose, version, useSymlink)
+
+	// Create directory symlinks for deferred locales (locale-level symlink mode)
+	var symlinkLocaleResults []DeployResult
+	if symlinkMode == "locale" && deferred != nil {
+		for key, otherLocales := range deferred {
+			firstLocale := kept[key]
+			firstDir := filepath.Join(magentoRoot, "pub/static", key.Area, key.Theme, firstLocale)
+
+			// Find the result for the first locale to get file count
+			var firstResult *DeployResult
+			for i := range results {
+				if results[i].Job.Theme == key.Theme && results[i].Job.Area == key.Area && results[i].Job.Locale == firstLocale {
+					firstResult = &results[i]
+					break
+				}
+			}
+
+			for _, otherLocale := range otherLocales {
+				otherDir := filepath.Join(magentoRoot, "pub/static", key.Area, key.Theme, otherLocale)
+
+				// Remove existing directory/symlink if present
+				os.RemoveAll(otherDir)
+
+				// Create relative symlink: otherLocale -> firstLocale
+				// Since both are siblings under the same parent, relative path is just the first locale name
+				relTarget, _ := filepath.Rel(filepath.Dir(otherDir), firstDir)
+				err := os.Symlink(relTarget, otherDir)
+
+				result := DeployResult{
+					Job:           DeployJob{Locale: otherLocale, Theme: key.Theme, Area: key.Area},
+					Symlinked:     true,
+					SymlinkTarget: firstLocale,
+				}
+				if err != nil {
+					result.Error = fmt.Sprintf("failed to create locale symlink: %v", err)
+				} else if firstResult != nil {
+					result.FilesCount = firstResult.FilesCount
+				}
+				symlinkLocaleResults = append(symlinkLocaleResults, result)
+			}
+		}
+		results = append(results, symlinkLocaleResults...)
+	}
 
 	// Ensure both minified and unminified versions of CSS/JS files exist
-	ensureMinifiedCounterparts(magentoRoot, results, verbose)
+	ensureMinifiedCounterparts(magentoRoot, results, verbose, useSymlink)
 
 	// Compile LESS files (email CSS) after file copying is complete
 	compileLessForResults(magentoRoot, results, verbose)
@@ -243,13 +325,13 @@ func deployStatic(magentoRoot string, locales, themes, areas []string, numJobs i
 // ensureMinifiedCounterparts walks each deployed directory and ensures that both
 // minified (.min.js/.min.css) and unminified versions exist for every CSS/JS file.
 // Magento's RequireJS resolver expects both to be present depending on store config.
-func ensureMinifiedCounterparts(magentoRoot string, results []DeployResult, verbose bool) {
+func ensureMinifiedCounterparts(magentoRoot string, results []DeployResult, verbose bool, useSymlink bool) {
 	if verbose {
 		fmt.Printf("\nEnsuring minified/unminified counterparts...\n")
 	}
 
 	for _, result := range results {
-		if result.Error != "" {
+		if result.Error != "" || result.Symlinked {
 			continue
 		}
 
@@ -267,32 +349,32 @@ func ensureMinifiedCounterparts(magentoRoot string, results []DeployResult, verb
 			// .min.js exists but .js counterpart does not
 			case strings.HasSuffix(name, ".min.js"):
 				counterpart := strings.TrimSuffix(path, ".min.js") + ".js"
-				if _, err := os.Stat(counterpart); os.IsNotExist(err) {
-					if copyFile(path, counterpart) == nil {
+				if _, err := os.Lstat(counterpart); os.IsNotExist(err) {
+					if placeFile(path, counterpart, useSymlink) == nil {
 						created++
 					}
 				}
 			// .js exists but .min.js counterpart does not
 			case strings.HasSuffix(name, ".js"):
 				counterpart := strings.TrimSuffix(path, ".js") + ".min.js"
-				if _, err := os.Stat(counterpart); os.IsNotExist(err) {
-					if copyFile(path, counterpart) == nil {
+				if _, err := os.Lstat(counterpart); os.IsNotExist(err) {
+					if placeFile(path, counterpart, useSymlink) == nil {
 						created++
 					}
 				}
 			// .min.css exists but .css counterpart does not
 			case strings.HasSuffix(name, ".min.css"):
 				counterpart := strings.TrimSuffix(path, ".min.css") + ".css"
-				if _, err := os.Stat(counterpart); os.IsNotExist(err) {
-					if copyFile(path, counterpart) == nil {
+				if _, err := os.Lstat(counterpart); os.IsNotExist(err) {
+					if placeFile(path, counterpart, useSymlink) == nil {
 						created++
 					}
 				}
 			// .css exists but .min.css counterpart does not
 			case strings.HasSuffix(name, ".css"):
 				counterpart := strings.TrimSuffix(path, ".css") + ".min.css"
-				if _, err := os.Stat(counterpart); os.IsNotExist(err) {
-					if copyFile(path, counterpart) == nil {
+				if _, err := os.Lstat(counterpart); os.IsNotExist(err) {
+					if placeFile(path, counterpart, useSymlink) == nil {
 						created++
 					}
 				}
@@ -319,8 +401,8 @@ func compileLessForResults(magentoRoot string, results []DeployResult, verbose b
 	}
 
 	for _, result := range results {
-		if result.Error != "" {
-			continue // Skip failed deployments
+		if result.Error != "" || result.Symlinked {
+			continue // Skip failed deployments and symlinked locales
 		}
 
 		destDir := filepath.Join(magentoRoot, "pub/static", result.Job.Area, result.Job.Theme, result.Job.Locale)
@@ -581,12 +663,12 @@ type deployTask struct {
 }
 
 // worker processes deployment jobs
-func worker(wg *sync.WaitGroup, jobChan <-chan *deployTask, magentoRoot string, verbose bool, version string) {
+func worker(wg *sync.WaitGroup, jobChan <-chan *deployTask, magentoRoot string, verbose bool, version string, useSymlink bool) {
 	defer wg.Done()
 
 	for task := range jobChan {
 		start := time.Now()
-		fileCount, err := deployTheme(magentoRoot, task.job, version)
+		fileCount, err := deployTheme(magentoRoot, task.job, version, useSymlink)
 
 		result := DeployResult{
 			Job:        task.job,
@@ -618,7 +700,7 @@ func worker(wg *sync.WaitGroup, jobChan <-chan *deployTask, magentoRoot string, 
 }
 
 // processJobs executes deployment jobs with parallelization
-func processJobs(magentoRoot string, jobs []DeployJob, numJobs int, verbose bool, version string) []DeployResult {
+func processJobs(magentoRoot string, jobs []DeployJob, numJobs int, verbose bool, version string, useSymlink bool) []DeployResult {
 	results := make([]DeployResult, len(jobs))
 	jobChan := make(chan *deployTask, numJobs)
 	var wg sync.WaitGroup
@@ -626,7 +708,7 @@ func processJobs(magentoRoot string, jobs []DeployJob, numJobs int, verbose bool
 	// Start worker goroutines
 	for i := 0; i < numJobs; i++ {
 		wg.Add(1)
-		go worker(&wg, jobChan, magentoRoot, verbose, version)
+		go worker(&wg, jobChan, magentoRoot, verbose, version, useSymlink)
 	}
 
 	// Send jobs to channel
@@ -654,7 +736,7 @@ func processJobs(magentoRoot string, jobs []DeployJob, numJobs int, verbose bool
 //    - vendor/*/src/view/{area}/web/
 //    - vendor/*/view/base/web/
 //    - vendor/*/src/view/base/web/
-func deployTheme(magentoRoot string, job DeployJob, version string) (int64, error) {
+func deployTheme(magentoRoot string, job DeployJob, version string, useSymlink bool) (int64, error) {
 	// Get the theme vendor/name
 	parts := strings.Split(job.Theme, "/")
 	if len(parts) != 2 {
@@ -687,7 +769,7 @@ func deployTheme(magentoRoot string, job DeployJob, version string) (int64, erro
 		// Try app/design path first
 		themeWebDir := filepath.Join(magentoRoot, "app/design", job.Area, chainVendor, chainName, "web")
 		if _, err := os.Stat(themeWebDir); err == nil {
-			count, err := copyDirectory(themeWebDir, destDir)
+			count, err := copyDirectory(themeWebDir, destDir, useSymlink)
 			if err != nil {
 				// Log but continue with other themes in chain
 				continue
@@ -700,7 +782,7 @@ func deployTheme(magentoRoot string, job DeployJob, version string) (int64, erro
 		if vendorThemePath != "" {
 			vendorWebDir := filepath.Join(vendorThemePath, "web")
 			if _, err := os.Stat(vendorWebDir); err == nil {
-				count, err := copyDirectory(vendorWebDir, destDir)
+				count, err := copyDirectory(vendorWebDir, destDir, useSymlink)
 				if err != nil {
 					continue
 				}
@@ -729,7 +811,7 @@ func deployTheme(magentoRoot string, job DeployJob, version string) (int64, erro
 					if _, err := os.Stat(moduleWebDir); err == nil {
 						// This is a module override - deploy to ModuleName/ prefix
 						moduleName := entry.Name()
-						count, err := copyDirectoryWithModulePrefix(moduleWebDir, destDir, moduleName)
+						count, err := copyDirectoryWithModulePrefix(moduleWebDir, destDir, moduleName, useSymlink)
 						if err != nil {
 							continue
 						}
@@ -748,7 +830,7 @@ func deployTheme(magentoRoot string, job DeployJob, version string) (int64, erro
 	}
 	for _, libDir := range libDirs {
 		if _, err := os.Stat(libDir); err == nil {
-			count, err := copyDirectory(libDir, destDir)
+			count, err := copyDirectory(libDir, destDir, useSymlink)
 			if err != nil {
 				return 0, fmt.Errorf("failed to copy library files from %s: %w", libDir, err)
 			}
@@ -786,7 +868,7 @@ func deployTheme(magentoRoot string, job DeployJob, version string) (int64, erro
 				// Check for view/{area}/web/ directory
 				extensionWebDir := filepath.Join(packagePath, "view", job.Area, "web")
 				if _, err := os.Stat(extensionWebDir); err == nil {
-					count, err := copyDirectoryWithModulePrefix(extensionWebDir, destDir, moduleName)
+					count, err := copyDirectoryWithModulePrefix(extensionWebDir, destDir, moduleName, useSymlink)
 					if err != nil {
 						// Log but don't fail on extension file errors
 						continue
@@ -797,7 +879,7 @@ func deployTheme(magentoRoot string, job DeployJob, version string) (int64, erro
 				// Also check src/view/{area}/web/ (for some packages)
 				extensionWebDirSrc := filepath.Join(packagePath, "src", "view", job.Area, "web")
 				if _, err := os.Stat(extensionWebDirSrc); err == nil {
-					count, err := copyDirectoryWithModulePrefix(extensionWebDirSrc, destDir, moduleName)
+					count, err := copyDirectoryWithModulePrefix(extensionWebDirSrc, destDir, moduleName, useSymlink)
 					if err != nil {
 						continue
 					}
@@ -807,7 +889,7 @@ func deployTheme(magentoRoot string, job DeployJob, version string) (int64, erro
 				// Also check view/base/web/ (for shared vendor modules like hyva-themes)
 				extensionBaseDir := filepath.Join(packagePath, "view", "base", "web")
 				if _, err := os.Stat(extensionBaseDir); err == nil {
-					count, err := copyDirectoryWithModulePrefix(extensionBaseDir, destDir, moduleName)
+					count, err := copyDirectoryWithModulePrefix(extensionBaseDir, destDir, moduleName, useSymlink)
 					if err != nil {
 						continue
 					}
@@ -817,7 +899,7 @@ func deployTheme(magentoRoot string, job DeployJob, version string) (int64, erro
 				// Also check src/view/base/web/ (for some packages)
 				extensionBaseDirSrc := filepath.Join(packagePath, "src", "view", "base", "web")
 				if _, err := os.Stat(extensionBaseDirSrc); err == nil {
-					count, err := copyDirectoryWithModulePrefix(extensionBaseDirSrc, destDir, moduleName)
+					count, err := copyDirectoryWithModulePrefix(extensionBaseDirSrc, destDir, moduleName, useSymlink)
 					if err != nil {
 						continue
 					}
@@ -841,7 +923,7 @@ func deployTheme(magentoRoot string, job DeployJob, version string) (int64, erro
 
 						moduleWebDir := filepath.Join(moduleDir, "view", job.Area, "web")
 						if _, err := os.Stat(moduleWebDir); err == nil {
-							count, err := copyDirectoryWithModulePrefix(moduleWebDir, destDir, subModuleName)
+							count, err := copyDirectoryWithModulePrefix(moduleWebDir, destDir, subModuleName, useSymlink)
 							if err != nil {
 								continue
 							}
@@ -851,7 +933,7 @@ func deployTheme(magentoRoot string, job DeployJob, version string) (int64, erro
 						// Also check view/base/web/
 						moduleBaseDir := filepath.Join(moduleDir, "view", "base", "web")
 						if _, err := os.Stat(moduleBaseDir); err == nil {
-							count, err := copyDirectoryWithModulePrefix(moduleBaseDir, destDir, subModuleName)
+							count, err := copyDirectoryWithModulePrefix(moduleBaseDir, destDir, subModuleName, useSymlink)
 							if err != nil {
 								continue
 							}
@@ -889,7 +971,7 @@ func deployTheme(magentoRoot string, job DeployJob, version string) (int64, erro
 				// Check for view/{area}/web/
 				moduleWebDir := filepath.Join(modulePath, "view", job.Area, "web")
 				if _, err := os.Stat(moduleWebDir); err == nil {
-					count, err := copyDirectoryWithModulePrefix(moduleWebDir, destDir, moduleName)
+					count, err := copyDirectoryWithModulePrefix(moduleWebDir, destDir, moduleName, useSymlink)
 					if err != nil {
 						continue
 					}
@@ -899,7 +981,7 @@ func deployTheme(magentoRoot string, job DeployJob, version string) (int64, erro
 				// Check for view/base/web/
 				moduleBaseDir := filepath.Join(modulePath, "view", "base", "web")
 				if _, err := os.Stat(moduleBaseDir); err == nil {
-					count, err := copyDirectoryWithModulePrefix(moduleBaseDir, destDir, moduleName)
+					count, err := copyDirectoryWithModulePrefix(moduleBaseDir, destDir, moduleName, useSymlink)
 					if err != nil {
 						continue
 					}
@@ -917,7 +999,7 @@ func deployTheme(magentoRoot string, job DeployJob, version string) (int64, erro
 }
 
 // copyDirectoryWithModulePrefix copies files with an optional module name prefix in the path
-func copyDirectoryWithModulePrefix(src, dst string, modulePrefix string) (int64, error) {
+func copyDirectoryWithModulePrefix(src, dst string, modulePrefix string, useSymlink bool) (int64, error) {
 	var fileCount int64
 
 	err := filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
@@ -943,11 +1025,11 @@ func copyDirectoryWithModulePrefix(src, dst string, modulePrefix string) (int64,
 			// Create destination subdirectory
 			os.MkdirAll(filepath.Dir(destPath), 0755)
 			// Skip if destination exists
-			if _, err := os.Stat(destPath); err == nil {
+			if _, err := os.Lstat(destPath); err == nil {
 				return nil
 			}
-			// Copy file
-			if err := copyFile(path, destPath); err != nil {
+			// Copy or symlink file
+			if err := placeFile(path, destPath, useSymlink); err != nil {
 				return err
 			}
 		} else {
@@ -955,11 +1037,11 @@ func copyDirectoryWithModulePrefix(src, dst string, modulePrefix string) (int64,
 			// Create destination subdirectory
 			os.MkdirAll(filepath.Dir(destPath), 0755)
 			// Skip if destination exists
-			if _, err := os.Stat(destPath); err == nil {
+			if _, err := os.Lstat(destPath); err == nil {
 				return nil
 			}
-			// Copy file
-			if err := copyFile(path, destPath); err != nil {
+			// Copy or symlink file
+			if err := placeFile(path, destPath, useSymlink); err != nil {
 				return err
 			}
 		}
@@ -972,45 +1054,25 @@ func copyDirectoryWithModulePrefix(src, dst string, modulePrefix string) (int64,
 }
 
 // copyDirectory recursively copies files from src to dst
-func copyDirectory(src, dst string) (int64, error) {
-	return copyDirectoryWithModulePrefix(src, dst, "")
+func copyDirectory(src, dst string, useSymlink bool) (int64, error) {
+	return copyDirectoryWithModulePrefix(src, dst, "", useSymlink)
 }
 
-// copyDirectoryWithModulePrefixOld recursively copies files from src to dst (old version kept for reference)
-func copyDirectoryOld(src, dst string) (int64, error) {
-	var fileCount int64
+// symlinkFile creates a relative symlink at dst pointing to src
+func symlinkFile(src, dst string) error {
+	relPath, err := filepath.Rel(filepath.Dir(dst), src)
+	if err != nil {
+		return fmt.Errorf("failed to compute relative path from %s to %s: %w", dst, src, err)
+	}
+	return os.Symlink(relPath, dst)
+}
 
-	err := filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if info.IsDir() {
-			return nil
-		}
-
-		// Calculate relative path
-		relPath, _ := filepath.Rel(src, path)
-		destPath := filepath.Join(dst, relPath)
-
-		// Create destination subdirectory
-		os.MkdirAll(filepath.Dir(destPath), 0755)
-
-		// Skip if destination exists (don't overwrite theme files with lib files)
-		if _, err := os.Stat(destPath); err == nil {
-			return nil
-		}
-
-		// Copy file
-		if err := copyFile(path, destPath); err != nil {
-			return err
-		}
-
-		atomic.AddInt64(&fileCount, 1)
-		return nil
-	})
-
-	return fileCount, err
+// placeFile either copies or symlinks src to dst depending on useSymlink
+func placeFile(src, dst string, useSymlink bool) error {
+	if useSymlink {
+		return symlinkFile(src, dst)
+	}
+	return copyFile(src, dst)
 }
 
 // copyFile copies a file from src to dst
@@ -1041,13 +1103,18 @@ func printResults(results []DeployResult, totalDuration time.Duration) {
 	totalFiles := int64(0)
 
 	for _, result := range results {
-		if result.Error == "" {
+		if result.Error != "" {
+			fmt.Printf("✗ %s\n", result.Error)
+		} else if result.Symlinked {
+			successCount++
+			totalFiles += result.FilesCount
+			fmt.Printf("✓ %s/%s (%s) → %s (symlinked)\n",
+				result.Job.Theme, result.Job.Area, result.Job.Locale, result.SymlinkTarget)
+		} else {
 			successCount++
 			totalFiles += result.FilesCount
 			fmt.Printf("✓ %s/%s (%s): %d files in %.1fs\n",
 				result.Job.Theme, result.Job.Area, result.Job.Locale, result.FilesCount, result.Duration.Seconds())
-		} else {
-			fmt.Printf("✗ %s\n", result.Error)
 		}
 	}
 
@@ -1261,4 +1328,3 @@ func shouldSkipFile(relPath string) bool {
 
 	return false
 }
-

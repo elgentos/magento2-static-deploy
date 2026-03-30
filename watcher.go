@@ -45,11 +45,11 @@ func (w *FileWatcher) Start() {
 				if w.hasChanges() {
 					fmt.Println("Changes detected. Running deployment...")
 					version := fmt.Sprintf("%d", time.Now().Unix())
-					fileCount, err := deployTheme(w.root, DeployJob{
-						Locale: "nl_NL",
-						Theme:  "Vendor/Hyva",
-						Area:   "frontend",
-					}, version)
+				fileCount, err := deployTheme(w.root, DeployJob{
+					Locale: "nl_NL",
+					Theme:  "Vendor/Hyva",
+					Area:   "frontend",
+				}, version, false)
 					if err != nil {
 						fmt.Printf("Error during deployment: %v\n", err)
 					} else {

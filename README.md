@@ -101,6 +101,11 @@ Options:
                                  Treats all themes as Hyvä (fast copy-only deployment)
 
       --php string               Path to PHP binary for Luma theme dispatch (default "php")
+
+      --symlink string           Use symlinks instead of file copies to reduce disk usage:
+                                 'file'   - per-file relative symlinks to source files
+                                 'locale' - directory-level symlinks for identical locales
+                                            (also uses per-file symlinks for the base locale)
 ```
 
 ## Examples
@@ -206,6 +211,46 @@ If you want to treat all themes as Hyvä (copy-only deployment without LESS/Requ
 3. Processes jobs in parallel using goroutines
 4. Reports results with timing and throughput metrics
 
+## Symlink Modes
+
+The `--symlink` flag reduces disk usage by creating symlinks instead of copying files.
+
+### Per-File Symlinks (`--symlink=file`)
+
+Creates relative symlinks from each destination file back to its source:
+
+    ./magento2-static-deploy -f --symlink=file -t Vendor/Hyva nl_NL en_US
+
+Each file in `pub/static/frontend/Vendor/Hyva/nl_NL/` will be a symlink pointing
+to its source in `vendor/`, `app/design/`, or `lib/web/`.
+
+### Locale-Level Symlinks (`--symlink=locale`)
+
+For Hyva themes, all locales produce identical file trees (locale is only used as
+a path segment, not for file selection). This mode deploys only one locale per
+theme+area combination and symlinks the rest:
+
+    ./magento2-static-deploy -f --symlink=locale -t Vendor/Hyva nl_NL en_US de_DE
+
+Result:
+- `pub/static/frontend/Vendor/Hyva/nl_NL/` — real deployment (with per-file symlinks)
+- `pub/static/frontend/Vendor/Hyva/en_US` → `nl_NL` (directory symlink)
+- `pub/static/frontend/Vendor/Hyva/de_DE` → `nl_NL` (directory symlink)
+
+### Web Server Configuration
+
+Your web server must follow symlinks when serving from `pub/static/`. This is typically
+the default but verify your configuration:
+
+- **Nginx**: Follows symlinks by default (no config needed)
+- **Apache**: Ensure `Options +FollowSymlinks` is set for the `pub/static/` directory
+
+### Limitations
+
+- **Windows**: Symlinks require elevated privileges or Developer Mode on Windows
+- **Luma themes**: Symlink modes only apply to Hyva theme deployments (Luma themes
+  dispatched to `bin/magento` are unaffected)
+
 ## What It Doesn't Do (Yet)
 
 This version performs file copying plus email CSS compilation. The following are handled separately:
@@ -300,6 +345,7 @@ While we now use PHP's `wikimedia/less.php` for email CSS compilation (matching 
 - ✅ Content version management
 - ✅ Verbose progress reporting
 - ✅ Email CSS compilation (email.css, email-inline.css, email-fonts.css)
+- ✅ Symlink modes for reduced disk usage
 
 ### Not Implemented
 
