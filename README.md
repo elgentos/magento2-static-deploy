@@ -103,9 +103,13 @@ Options:
       --php string               Path to PHP binary for Luma theme dispatch (default "php")
 
       --symlink string           Use symlinks instead of file copies to reduce disk usage:
-                                 'file'   - per-file relative symlinks to source files
-                                 'locale' - directory-level symlinks for identical locales
-                                            (also uses per-file symlinks for the base locale)
+                                 'file'             - per-file relative symlinks to source files
+                                 'locale'           - directory-level symlinks for identical locales
+                                                       (also uses per-file symlinks for the base locale)
+                                 'locale-contained' - like 'locale', but the base locale is deployed
+                                                       as real files, so the whole pub/static tree is
+                                                       self-contained (no dependency on the Magento
+                                                       source tree being present at request time)
 ```
 
 ## Examples
@@ -236,6 +240,31 @@ Result:
 - `pub/static/frontend/Vendor/Hyva/nl_NL/` — real deployment (with per-file symlinks)
 - `pub/static/frontend/Vendor/Hyva/en_US` → `nl_NL` (directory symlink)
 - `pub/static/frontend/Vendor/Hyva/de_DE` → `nl_NL` (directory symlink)
+
+Note that in this mode the base locale (`nl_NL` above) is itself deployed using
+per-file symlinks back to source (`app/design/`, `vendor/`, `lib/web/`). This
+means the resulting `pub/static` tree still depends on the Magento source tree
+being present wherever it's served from. If you need `pub/static` to be fully
+self-contained — for example when only `pub/static` is copied into a separate
+runtime image via a Docker multi-stage build — use `locale-contained` instead.
+
+### Self-Contained Locale-Level Symlinks (`--symlink=locale-contained`)
+
+Same grouping/symlinking strategy as `locale`, but the base locale is deployed
+as real files instead of per-file symlinks to source:
+
+    ./magento2-static-deploy -f --symlink=locale-contained -t Vendor/Hyva nl_NL en_US de_DE
+
+Result:
+- `pub/static/frontend/Vendor/Hyva/nl_NL/` — real deployment (real files, not symlinks)
+- `pub/static/frontend/Vendor/Hyva/en_US` → `nl_NL` (directory symlink)
+- `pub/static/frontend/Vendor/Hyva/de_DE` → `nl_NL` (directory symlink)
+
+Because every file under `pub/static` is now either a real file or a symlink
+that resolves to another path inside `pub/static` itself, the whole tree can
+be copied on its own — e.g. `COPY --from=build-stage /app/pub/static/ /app/pub/static/`
+in a Dockerfile — into a runtime image that never has the Magento source tree available,
+and it will still resolve correctly.
 
 ### Web Server Configuration
 
