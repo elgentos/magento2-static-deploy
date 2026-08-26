@@ -76,7 +76,7 @@ func init() {
 	flag.StringVar(&contentVersion, "content-version", "", "Custom version of static content")
 	flag.BoolVar(&noLumaDispatch, "no-luma-dispatch", false, "Disable automatic dispatch of Luma themes to bin/magento")
 	flag.StringVar(&phpBinary, "php", "php", "Path to PHP binary for Luma theme dispatch")
-	flag.StringVar(&symlinkMode, "symlink", "", "Use symlinks instead of copies: 'file' (per-file symlinks to source) or 'locale' (directory-level symlinks for identical locales)")
+	flag.StringVar(&symlinkMode, "symlink", "", "Use symlinks instead of copies: 'file' (per-file symlinks to source), 'locale' (directory-level symlinks for identical locales; base locale uses per-file symlinks to source), or 'locale-contained' (like 'locale', but the base locale is deployed as real files so the whole pub/static tree is self-contained)")
 
 	// Custom usage message
 	flag.Usage = func() {
@@ -96,8 +96,8 @@ func init() {
 func main() {
 	flag.Parse()
 
-	if symlinkMode != "" && symlinkMode != "file" && symlinkMode != "locale" {
-		fmt.Fprintf(os.Stderr, "Error: --symlink must be 'file' or 'locale', got '%s'\n", symlinkMode)
+	if symlinkMode != "" && symlinkMode != "file" && symlinkMode != "locale" && symlinkMode != "locale-contained" {
+		fmt.Fprintf(os.Stderr, "Error: --symlink must be 'file', 'locale', or 'locale-contained', got '%s'\n", symlinkMode)
 		os.Exit(1)
 	}
 
@@ -225,18 +225,24 @@ func deployStatic(magentoRoot string, locales, themes, areas []string, numJobs i
 		version = fmt.Sprintf("%d", time.Now().Unix())
 	}
 
-	useSymlink := (symlinkMode == "file" || symlinkMode == "locale")
+	isLocaleSymlinkMode := symlinkMode == "locale" || symlinkMode == "locale-contained"
+
+	// In 'locale' mode the base locale itself is deployed using per-file symlinks
+	// to source (kept for backwards compatibility). In 'locale-contained' mode the
+	// base locale is deployed as real files, so every symlink under pub/static
+	// resolves to another path inside pub/static itself.
+	useSymlink := symlinkMode == "file" || symlinkMode == "locale"
 
 	// Create deployment jobs
 	jobs := createDeployJobs(locales, themes, areas)
 
-	// Locale-level symlink mode: only deploy the first locale per (theme, area)
+	// Locale-level symlink modes: only deploy the first locale per (theme, area)
 	// group and create directory symlinks for the rest
 	type themeAreaKey struct{ Theme, Area string }
 	var kept map[themeAreaKey]string
 	var deferred map[themeAreaKey][]string
 
-	if symlinkMode == "locale" && len(locales) > 1 {
+	if isLocaleSymlinkMode && len(locales) > 1 {
 		kept = make(map[themeAreaKey]string)
 		deferred = make(map[themeAreaKey][]string)
 		var filteredJobs []DeployJob
@@ -261,9 +267,9 @@ func deployStatic(magentoRoot string, locales, themes, areas []string, numJobs i
 	// Process jobs in parallel
 	results := processJobs(magentoRoot, jobs, numJobs, verbose, version, useSymlink)
 
-	// Create directory symlinks for deferred locales (locale-level symlink mode)
+	// Create directory symlinks for deferred locales (locale-level symlink modes)
 	var symlinkLocaleResults []DeployResult
-	if symlinkMode == "locale" && deferred != nil {
+	if isLocaleSymlinkMode && deferred != nil {
 		for key, otherLocales := range deferred {
 			firstLocale := kept[key]
 			firstDir := filepath.Join(magentoRoot, "pub/static", key.Area, key.Theme, firstLocale)
